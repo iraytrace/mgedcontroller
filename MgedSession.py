@@ -2,11 +2,10 @@
 
 MGED is launched as a child process with its stdin/stdout connected to pipes.
 Because stdin is redirected, MGED runs non-interactively (it prints no `mged>`
-prompt) and simply executes whatever commands are piped to it. It therefore
-emits nothing to indicate when a command has finished. To get a reliable
-request/response model we append `puts "<sentinel>"` after every command: a
-background reader thread accumulates stdout lines until it sees the sentinel,
-then hands the collected output to the matching MgedCommand future (FIFO order).
+prompt) and simply executes whatever commands are piped to it. MGED's pipe mode
+prints a sentinel after every command; a background reader thread accumulates
+stdout lines until it sees that sentinel, then hands the collected output to the
+matching MgedCommand future (FIFO order).
 
 The interface is designed to serve two kinds of consumer from one API:
 
@@ -34,11 +33,24 @@ import shutil
 import subprocess
 import threading
 import time
+from dataclasses import dataclass
 
 
 class MgedException(Exception):
     """Raised for errors communicating with MGED."""
     pass
+
+
+@dataclass(frozen=True)
+class HierarchyNode:
+    """One object occurrence in an MGED hierarchy search result."""
+
+    path: str
+    depth: int
+    operator: str
+    name: str
+    object_type: str
+    kind: str
 
 
 def parse_attach_args(args_str):
@@ -110,22 +122,112 @@ def _brace_groups(block):
 
 
 def parse_search_names(text):
-    """Parse MGED 'search'/'ls' output into a de-duplicated list of leaf names.
-
-    'search . -type bot' prints one path/name per line; 'ls' prints several
-    whitespace-separated names per line. Both are handled: each whitespace token
-    is reduced to its leaf (after the last '/') and de-duplicated in order.
-    """
+    """Parse ``search .`` output as one complete object name per line."""
     if not text:
         return []
     names = []
-    seen = set()
     for line in text.splitlines():
-        for token in line.split():
-            leaf = token.rsplit("/", 1)[-1]
-            if leaf and leaf not in seen:
-                seen.add(leaf)
-                names.append(leaf)
+        name = line.strip()
+        if not name or (name.startswith("[") and "items found in search" in name):
+            continue
+        names.append(name)
+    return names
+
+
+def _hierarchy_kind(object_type):
+    """Map an MGED object type to the categories used by the Blender view."""
+    if object_type == "c":
+        return "comb"
+    if object_type == "r":
+        return "region"
+    if object_type == "bot":
+        return "bot"
+    return "primitive"
+
+
+def _parse_verbose_search_component(component):
+    """Parse one ``O name(type)`` component from ``search -vvv /``."""
+    if len(component) < 5 or component[0] not in "u-+" or component[1] != " ":
+        return None
+    type_start = component.rfind("(")
+    if type_start < 2 or not component.endswith(")"):
+        return None
+    name = component[2:type_start]
+    object_type = component[type_start + 1:-1]
+    if not name or not object_type:
+        return None
+    return component[0], name, object_type
+
+
+def parse_search_hierarchy(text):
+    """Parse ``search -vvv /`` into ordered :class:`HierarchyNode` objects.
+
+    Search emits one full occurrence path per line. Repeated paths are retained
+    because a combination may reference the same member more than once.
+    """
+    if not text:
+        return []
+    nodes = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("/"):
+            continue
+        parsed_components = []
+        for component in line.split("/")[1:]:
+            parsed = _parse_verbose_search_component(component)
+            if parsed is None:
+                parsed_components = []
+                break
+            parsed_components.append(parsed)
+        if not parsed_components:
+            continue
+        operator, name, object_type = parsed_components[-1]
+        path = "/" + "/".join(
+            component_name for _, component_name, _ in parsed_components)
+        depth = len(parsed_components) - 1
+        nodes.append(HierarchyNode(
+            path=path,
+            depth=depth,
+            operator="" if depth == 0 else operator,
+            name=name,
+            object_type=object_type,
+            kind=_hierarchy_kind(object_type),
+        ))
+    return nodes
+
+
+def parse_who_names(text, known_names=None):
+    """Parse ``who`` output, optionally matching known names containing spaces.
+
+    MGED separates displayed entries with spaces but does not quote entries that
+    themselves contain spaces. When candidates are supplied, longest matching
+    names are consumed first; otherwise this retains the historical whitespace
+    token behavior.
+    """
+    if not text:
+        return []
+    if not known_names:
+        return text.split()
+    candidates = sorted({name for name in known_names if name},
+                        key=lambda name: (-len(name), name))
+    names = []
+    position = 0
+    while position < len(text):
+        while position < len(text) and text[position].isspace():
+            position += 1
+        if position >= len(text):
+            break
+        match = next((name for name in candidates
+                      if text.startswith(name, position)
+                      and (position + len(name) == len(text)
+                           or text[position + len(name)].isspace())), None)
+        if match is None:
+            end = position
+            while end < len(text) and not text[end].isspace():
+                end += 1
+            match = text[position:end]
+        names.append(match)
+        position += len(match)
     return names
 
 
@@ -381,7 +483,7 @@ class MgedSession:
 
     # Marker printed after each command so the reader knows where its output
     # ends. Made distinctive to avoid colliding with real command output.
-    SENTINEL = "MGED_CMD_DONE 919"
+    SENTINEL = "MGED_CMD_DONE"
 
     def __init__(self, mged_path, command_line_options=None, *,
                  log_file=None, log_to_console=False,
@@ -468,16 +570,19 @@ class MgedSession:
 
         ``attach`` issues ``attach <dm>`` after startup (the reliable way to
         attach a display manager when stdin is piped -- prefer this over putting
-        ``-a <dm>`` in ``command_line_options``). With ``wait=True`` (default)
-        this blocks until MGED answers a handshake and raises on timeout; with
-        ``wait=False`` it returns the handshake future immediately so a GUI host
-        can poll ``is_done`` for readiness without stalling. Returns the
-        handshake :class:`MgedCommand`.
+        ``-a <dm>`` in ``command_line_options``). Pipe mode is added to the
+        command line automatically. With ``wait=True`` (default) this blocks
+        until MGED answers a handshake and raises on timeout; with ``wait=False``
+        it returns the handshake future immediately so a GUI host can poll
+        ``is_done`` for readiness without stalling. Returns the handshake
+        :class:`MgedCommand`.
         """
         if self.running:
             raise MgedException("MGED is already running.")
 
         commandline = [self.mged_path] + self.command_line_options
+        if "-p" not in commandline and "--pipe" not in commandline:
+            commandline.append("-p")
         if db_path:
             commandline.append(db_path)
 
@@ -529,7 +634,7 @@ class MgedSession:
                 future.add_done_callback(callback)
             self._pending_futures.put(future)
             self._logger.command(command_text, is_internal=is_internal)
-            # The trailing sentinel marks the end of this command's output.
+            # MGED pipe mode emits the sentinel after processing this command.
             payload = f'{command_text}\n'
             try:
                 self.process.stdin.write(payload)
@@ -541,10 +646,15 @@ class MgedSession:
     def list_bots(self, timeout=10):
         """Return the names of all BOT objects in the open database.
 
-        Uses ``search . -type bot`` and reduces results to de-duplicated leaf
-        names. Returns [] if the query is empty or times out.
+        ``search . -type bot`` is authoritative and emits one complete object
+        name per line. Returns [] if the query is empty or times out.
         """
         result = self.send_command("search . -type bot").result(timeout=timeout)
+        return parse_search_names(result)
+
+    def list_objects(self, timeout=10):
+        """Return the authoritative list of all objects in the open database."""
+        result = self.send_command("search .").result(timeout=timeout)
         return parse_search_names(result)
 
     def tops(self, timeout=10):
@@ -556,30 +666,19 @@ class MgedSession:
         result = self.send_command(f"tree {shlex.quote(name)}").result(timeout=timeout)
         return parse_tree(result)
 
-    def who(self, timeout=10):
+    def who(self, timeout=10, *, known_names=None):
         """Return the names of objects currently displayed in the MGED view."""
-        return parse_search_names(self.send_command("who").result(timeout=timeout))
+        result = self.send_command("who").result(timeout=timeout)
+        return parse_who_names(result, known_names)
 
     def object_types(self, timeout=10):
         """Return {name: object_type} for every object in the database ('ls -l')."""
         return parse_ls_l(self.send_command("ls -l").result(timeout=timeout))
 
     def hierarchy(self, timeout=10):
-        """Return the whole database hierarchy from tops, flattened depth-first.
-
-        Each entry is (depth, op, name, kind), where kind is 'comb', 'region',
-        'bot' (a BOT primitive), or 'primitive' (any other solid). A leaf top
-        with no subtree yields a single depth-0 node.
-        """
-        nodes = []
-        for name, kind in self.tops(timeout=timeout):
-            sub = self.tree(name, timeout=timeout)
-            nodes.extend(sub if sub else [(0, "", name, kind)])
-        # Distinguish BOT primitives from other solids (the tree output can't);
-        # 'ls -l' gives the actual object type for every name.
-        types = self.object_types(timeout=timeout)
-        return [(d, op, n, "bot" if (k == "primitive" and types.get(n) == "bot") else k)
-                for (d, op, n, k) in nodes]
+        """Return all hierarchy occurrences from one ``search -vvv /`` query."""
+        result = self.send_command("search -vvv /").result(timeout=timeout)
+        return parse_search_hierarchy(result)
 
     def get_bot(self, name, timeout=10):
         """Read a BOT's geometry from MGED. Returns (verts, faces) or None.
@@ -689,7 +788,12 @@ class MgedSession:
 
 
 def main():
-    mged_exe = shutil.which('mged') or r"D:\BRL-CAD_7.43.0_win64\bin\mged.exe"
+    configured = os.environ.get("MGED_EXE")
+    development = r"C:\bvldsw\BRL-CAD_7.47.0_win64\bin\mged.exe"
+    fallback = r"D:\BRL-CAD_7.43.0_win64\bin\mged.exe"
+    mged_exe = (configured if configured and os.path.exists(configured) else
+                development if os.path.exists(development) else
+                shutil.which("mged") or fallback)
     if not os.path.exists(mged_exe):
         print(f"mged not found: {mged_exe}")
         return
